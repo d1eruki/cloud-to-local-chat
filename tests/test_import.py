@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 
-from cloud_to_local_chat import build_rollout, prepare_source, restore_dates, register_project, copy_images, existing_project, reset_catalog_sync
+from cloud_to_local_chat import build_rollout, prepare_source, restore_dates, register_project, copy_images, copy_files, existing_project, reset_catalog_sync
 
 
 def source():
@@ -14,6 +14,33 @@ def source():
 
 
 class ImportTests(unittest.TestCase):
+    def test_file_cards_follow_project_files_and_missing_files_stay_missing(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pdf = root / 'Доверенность.pdf'
+            pdf.write_bytes(b'%PDF-1.7\noriginal')
+            missing = root / 'absent.pdf.sig'
+            data = source()
+            question = data['turns'][0]['items'][0]
+            question['id'] = 'u'
+            header = '# Files mentioned by the user:\n\n## Доверенность.pdf: ' + str(pdf) + '\n\n## Доверенность.pdf.sig: ' + str(missing) + '\n\n## My request:\n'
+            question['content'].insert(0, {'type': 'text', 'text': header})
+            data['provenance'] = {'fileAttachments': [
+                {'messageId': 'u', 'id': 'file-pdf', 'name': 'Доверенность.pdf', 'status': 'available', 'path': str(pdf)},
+                {'messageId': 'u', 'id': 'file-sig', 'name': 'Доверенность.pdf.sig', 'status': 'unavailable', 'path': str(missing)}]}
+            project = root / 'project'
+            normalized = copy_files(data, project)
+            files = normalized['provenance']['fileAttachments']
+            self.assertEqual(Path(files[0]['path']).read_bytes(), pdf.read_bytes())
+            self.assertEqual(files[0]['sha256'], hashlib.sha256(pdf.read_bytes()).hexdigest())
+            for file in files:
+                self.assertTrue(Path(file['path']).is_relative_to(project))
+                self.assertIn(file['path'], normalized['turns'][0]['items'][0]['content'][0]['text'])
+            self.assertFalse(Path(files[1]['path']).exists())
+            self.assertEqual(normalized['turns'][0]['items'][0]['content'][1:], question['content'][1:])
+            self.assertEqual(copy_files(normalized, project), normalized)
+
     def test_catalog_refresh_preserves_entries_and_other_hosts(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()

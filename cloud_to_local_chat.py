@@ -217,6 +217,51 @@ def copy_images(source, project_root):
     return result, list(copied.values())
 
 
+def copy_files(source, project_root):
+    """Переносит документы и описания отсутствующих файлов вместе с карточками."""
+    result = deepcopy(source)
+    root = Path(project_root).resolve()
+    for file in result.get('provenance', {}).get('fileAttachments', []):
+        name, identifier = file['name'], file['id']
+        if (not name or name in ('.', '..') or any(c in name for c in ('/', '\\', '\n', '\r', '\x00'))
+                or not re.fullmatch(r'file[-_][a-zA-Z0-9_-]+', identifier)):
+            raise ValueError('Неверное имя или идентификатор вложения.')
+        original = Path(file['path']).resolve()
+        if file['status'] == 'unavailable':
+            target = original if original.is_relative_to(root) else root / 'unavailable' / identifier / name
+            if original.exists() or target.exists():
+                raise ValueError('Недоступный файл появился на диске; требуется сверка.')
+        elif file['status'] == 'available':
+            data = original.read_bytes()
+            checksum = hashlib.sha256(data).hexdigest()
+            if file.get('sha256', checksum) != checksum:
+                raise ValueError('Контрольная сумма документа отличается от исходной.')
+            target = original if original.is_relative_to(root) else root / 'files' / checksum / name
+            if target.exists() and target.read_bytes() != data:
+                raise ValueError('Конфликт файла документа.')
+            if not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, target)
+            file['sha256'] = checksum
+        else:
+            raise ValueError('Неизвестный статус вложения.')
+        old_card = '## ' + name + ': ' + str(original)
+        new_card = '## ' + name + ': ' + str(target)
+        found = False
+        for turn in result['turns']:
+            for item in turn['items']:
+                if item.get('id') != file['messageId'] or item['type'] != 'userMessage':
+                    continue
+                for part in item['content']:
+                    if part.get('type') == 'text' and part['text'].startswith('# Files mentioned by the user:\n') and old_card in part['text'].splitlines():
+                        part['text'] = part['text'].replace(old_card, new_card)
+                        found = True
+        if not found:
+            raise ValueError('Документ не привязан к исходному сообщению.')
+        file['path'] = str(target)
+    return result
+
+
 def write_atomic(path, content, expected=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -515,6 +560,7 @@ def migrate(source, project_root, project_name, data_dir, executable='codex', co
         codex_home = Path(codex_home).resolve()
         codex_home.mkdir(parents=True, exist_ok=True)
     source, images = copy_images(source, project_root)
+    source = copy_files(source, project_root)
     items = prepare_source(source)
     client = Client(executable, codex_home)
     receipt = {'sourceId': source['thread']['id'], 'status': 'creating'}
@@ -523,7 +569,8 @@ def migrate(source, project_root, project_name, data_dir, executable='codex', co
         if project is None:
             project = client.rpc('project/create', {'idempotencyKey': 'cloud-to-local-' + hashlib.sha256(str(project_root).encode()).hexdigest(), 'name': project_name, 'roots': [{'path': str(project_root)}]})['project']
         thread = client.rpc('thread/start', {'cwd': str(project_root), 'projectId': project['id'], 'historyMode': 'paginated', 'ephemeral': False, 'threadSource': 'user'})['thread']
-        receipt.update(project=project, threadId=thread['id'], path=thread['path'], images=images, provenance=source.get('provenance', {}))
+        receipt.update(project=project, threadId=thread['id'], path=thread['path'], images=images,
+                       files=source.get('provenance', {}).get('fileAttachments', []), provenance=source.get('provenance', {}))
         receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
         client.rpc('thread/name/set', {'threadId': thread['id'], 'name': source['thread']['title']})
         client.rpc('thread/inject_items', {'threadId': thread['id'], 'items': items})
@@ -620,7 +667,8 @@ def transfer_project(project_id, project_root, auth_data, executable='codex', co
                             payload = response.json()
                         source = export_payload(context, token, payload, identifier, output)
                     entry.update(sourcePath=str(source_path), status='downloaded',
-                        processCardsStoredInRaw=source.get('provenance', {}).get('processCardsStoredInRaw', []))
+                        processCardsStoredInRaw=source.get('provenance', {}).get('processCardsStoredInRaw', []),
+                        unavailableFileAttachments=[f for f in source.get('provenance', {}).get('fileAttachments', []) if f.get('status') == 'unavailable'])
                     save()
                     if entry.get('existingThreadId'):
                         client = Client(executable, codex_home)
@@ -650,6 +698,8 @@ def transfer_project(project_id, project_root, auth_data, executable='codex', co
         finally:
             context.close()
     report['summary'] = {status: sum(e.get('status') == status for e in report['entries'].values()) for status in ('prepared', 'existing', 'error')}
+    report['unavailableFileCount'] = sum(len(e.get('unavailableFileAttachments', [])) for e in report['entries'].values())
+    report['attachmentsComplete'] = report['unavailableFileCount'] == 0 and report['summary']['error'] == 0
     save()
     return report['summary']
 

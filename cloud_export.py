@@ -40,9 +40,10 @@ def active_messages(payload, identifier):
     return list(reversed(messages))
 
 
-def convert(payload, identifier, get_image):
+def convert(payload, identifier, get_image, get_file=None):
     """Выбирает текущую ветку; не переносит скрытые сообщения и старые варианты."""
     turns, turn, process_cards, voice_transcripts = [], None, [], []
+    file_attachments = []
     for message in active_messages(payload, identifier):
         role = message.get('author', {}).get('role')
         metadata = message.get('metadata', {})
@@ -60,6 +61,15 @@ def convert(payload, identifier, get_image):
             # Отдельные карточки процесса остаются в полном raw.json.
             # В диалог импортируются вопросы и ответы; пропуск фиксируется.
             process_cards.append({'id': message['id'], 'contentType': kind})
+            continue
+        if (role == 'tool' and message.get('author', {}).get('name') == 'file_search'
+                and kind == 'multimodal_text' and content.get('parts')
+                and any(isinstance(p, dict) for p in content['parts'])
+                and all(isinstance(p, str) or (isinstance(p, dict) and p.get('content_type') == 'image_asset_pointer'
+                        and re.search(r'#file[-_][a-zA-Z0-9_-]+#p_\d+\.', p.get('asset_pointer', '')))
+                        for p in content['parts'])):
+            process_cards.append({'id': message['id'], 'contentType': kind,
+                                  'reason': 'internal-document-page-previews'})
             continue
         if role == 'assistant' and message.get('channel') == 'analysis':
             raise ValueError('Этот чат содержит отдельные рассуждения или действия; перенос пока не поддерживается.')
@@ -79,7 +89,6 @@ def convert(payload, identifier, get_image):
                     raise ValueError('У голосового сообщения отсутствует текстовая расшифровка.')
                 if not text.strip():
                     empty_transcription = True
-                    text = '[Голосовой ввод: в исходном чате пустая расшифровка.]'
                 parts.append({'type': 'text', 'text': text})
                 has_transcription = True
             elif isinstance(part, dict) and part.get('content_type') in ('audio_asset_pointer', 'real_time_user_audio_video_asset_pointer'):
@@ -95,11 +104,33 @@ def convert(payload, identifier, get_image):
                                       'audioContentTypesStoredInRaw': audio_types,
                                       'emptyTranscription': empty_transcription})
         if metadata.get('attachments'):
+            image_attachments = 0
+            file_cards = []
             for attachment in metadata['attachments']:
-                if not str(attachment.get('mime_type', '')).startswith('image/'):
-                    raise ValueError('Вложения кроме картинок пока не поддерживаются.')
-            if len(metadata['attachments']) > len(images):
+                if str(attachment.get('mime_type', '')).startswith('image/'):
+                    image_attachments += 1
+                    continue
+                document_suffix(attachment)
+                if role != 'user' or get_file is None:
+                    raise ValueError('Для вложенного документа требуется скачивание оригинала.')
+                result = get_file(attachment)
+                if not isinstance(result, dict):
+                    result = {'path': str(result), 'status': 'available'}
+                if result.get('status') not in ('available', 'unavailable'):
+                    raise ValueError('Неизвестный статус вложения.')
+                unavailable = result['status'] == 'unavailable'
+                path = Path(result['path']).resolve(strict=not unavailable)
+                if unavailable and path.exists():
+                    raise ValueError('Путь недоступного файла уже существует.')
+                file_cards.append('## ' + attachment['name'] + ': ' + str(path))
+                file_attachments.append({**result, 'messageId': message['id'], 'id': attachment['id'],
+                                         'name': attachment['name'], 'mimeType': attachment.get('mime_type'),
+                                         'sourceSize': attachment.get('size'), 'path': str(path)})
+            if image_attachments > len(images):
                 raise ValueError('Не все вложения сопоставлены с оригиналами изображений.')
+            if file_cards:
+                parts.insert(0, {'type': 'text', 'text': '# Files mentioned by the user:\n\n'
+                                + '\n\n'.join(file_cards) + '\n\n## My request:\n'})
         if role == 'tool' and (parts or not images):
             raise ValueError('Текстовые ответы инструментов пока не поддерживаются.')
         if role == 'user':
@@ -131,10 +162,32 @@ def convert(payload, identifier, get_image):
               'page': {'hasMore': False}, 'turns': turns,
               'provenance': {'method': 'authenticated-conversation-response', 'branch': payload.get('current_node'),
                              'processCardsStoredInRaw': process_cards,
-                             'voiceTranscripts': voice_transcripts}}
+                             'voiceTranscripts': voice_transcripts,
+                             'fileAttachments': file_attachments}}
     from cloud_to_local_chat import prepare_source
     prepare_source(source)
     return source
+
+
+def document_suffix(attachment, data=None):
+    name = attachment.get('name')
+    if (not isinstance(name, str) or not name or name in ('.', '..')
+            or any(c in name for c in ('/', '\\', '\n', '\r', '\x00'))):
+        raise ValueError('У документа отсутствует имя.')
+    mime = attachment.get('mime_type')
+    if name.lower().endswith('.pdf.sig') and mime in (None, 'application/octet-stream', 'application/pkcs7-signature'):
+        suffix = '.pdf.sig'
+    elif name.lower().endswith('.pdf') and mime in (None, 'application/pdf'):
+        suffix = '.pdf'
+    else:
+        suffix = Path(name).suffix.lower()
+    if data is not None:
+        size = attachment.get('size')
+        if not data or (size is not None and (type(size) is not int or len(data) != size)):
+            raise ValueError('Размер скачанного документа отличается от исходного.')
+        if suffix == '.pdf' and not data.startswith(b'%PDF-'):
+            raise ValueError('Вместо PDF получен неизвестный файл или страница ошибки.')
+    return suffix
 
 
 def image_suffix(data):
@@ -318,6 +371,52 @@ def export_payload(context, token, payload, identifier, output, progress=print):
     (output / "raw.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     cache = {}
 
+    def download_file(attachment):
+        suffix = document_suffix(attachment)
+        identifier = attachment.get('id', '')
+        if not isinstance(identifier, str) or not re.fullmatch(r'file[-_][a-zA-Z0-9_-]+', identifier):
+            raise ValueError('Неподдерживаемый идентификатор документа.')
+        key = (identifier, suffix)
+        if key in cache:
+            return cache[key]
+        def unavailable(status):
+            path = output / 'unavailable' / identifier / attachment['name']
+            if path.exists():
+                raise ValueError('Путь заглушки уже существует; требуется сверка вложения.')
+            result = {'path': str(path), 'status': 'unavailable', 'httpStatus': status}
+            cache[key] = result
+            progress('  Файл недоступен (HTTP ' + str(status) + '); сохранена карточка вложения.', flush=True)
+            return result
+        resolver = http_get(context, 'https://chatgpt.com/backend-api/files/' + identifier + '/download',
+                            headers={'Authorization': 'Bearer ' + token}, max_redirects=0)
+        if resolver.status == 404:
+            resolver = http_get(context, 'https://chatgpt.com/backend-api/files/download/' + identifier,
+                                headers={'Authorization': 'Bearer ' + token}, max_redirects=0,
+                                params={'conversation_id': payload.get('conversation_id', payload.get('id')),
+                                        'download_intent': 'true', 'inline': 'false'})
+        if resolver.status in (404, 410):
+            return unavailable(resolver.status)
+        if resolver.status != 200:
+            raise RuntimeError('Оригинал документа недоступен (HTTP ' + str(resolver.status) + '). Перенос остановлен.')
+        asset_url = resolver.json().get('download_url', '')
+        if not allowed_asset_url(asset_url):
+            raise ValueError('Неизвестный адрес сервера документов; файл не скачан.')
+        response = http_get(context, asset_url, max_redirects=0, timeout=120000)
+        if response.status in (404, 410):
+            return unavailable(response.status)
+        if response.status != 200:
+            raise RuntimeError('Не удалось скачать документ (HTTP ' + str(response.status) + ').')
+        data = response.body()
+        document_suffix(attachment, data)
+        checksum = hashlib.sha256(data).hexdigest()
+        directory = output / 'files' / checksum
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / attachment['name']
+        path.write_bytes(data)
+        cache[key] = {'path': str(path), 'status': 'available', 'sha256': checksum}
+        progress('  Документ: сохранён (' + str(len(data)) + ' байт).', flush=True)
+        return cache[key]
+
     def download(pointer):
         if pointer in cache:
             return cache[pointer]
@@ -342,9 +441,9 @@ def export_payload(context, token, payload, identifier, output, progress=print):
         path = directory / (hashlib.sha256(data).hexdigest() + suffix)
         path.write_bytes(data)
         cache[pointer] = str(path)
-        progress('  Картинка ' + str(len(cache)) + ': сохранена (' + str(len(data)) + ' байт).', flush=True)
+        progress('  Картинка ' + str(sum(isinstance(key, str) for key in cache)) + ': сохранена (' + str(len(data)) + ' байт).', flush=True)
         return str(path)
 
-    source = convert(payload, identifier, download)
+    source = convert(payload, identifier, download, download_file)
     (output / "source.json").write_text(json.dumps(source, ensure_ascii=False, indent=2), encoding="utf-8")
     return source

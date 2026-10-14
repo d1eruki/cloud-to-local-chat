@@ -2,7 +2,7 @@ import unittest
 from contextlib import closing
 import tempfile
 from pathlib import Path
-from cloud_export import active_messages, chat_id, convert, image_suffix, allowed_asset_url, manual_login, has_login, snapshot_profile, http_get, list_project_chats
+from cloud_export import active_messages, chat_id, convert, image_suffix, allowed_asset_url, manual_login, has_login, snapshot_profile, http_get, list_project_chats, document_suffix, export_payload
 
 
 def payload():
@@ -17,6 +17,96 @@ def payload():
 
 
 class ExportTests(unittest.TestCase):
+    def test_pdf_and_signature_are_saved_and_linked_to_original_question(self):
+        import hashlib
+        from unittest.mock import Mock
+        data = payload()
+        pdf, signature = b'%PDF-1.7\noriginal', b'\x30\x82signature'
+        attachments = [{'id': 'file-pdf', 'name': 'Document.pdf', 'mime_type': 'application/pdf', 'size': len(pdf)},
+                       {'id': 'file-sig', 'name': 'Document.pdf.sig', 'size': len(signature)}]
+        data['mapping']['u']['message']['metadata'] = {'attachments': attachments}
+        context = Mock()
+        context.request.get.side_effect = [
+            Mock(status=404),
+            Mock(status=200, json=Mock(return_value={'download_url': 'https://files.oaiusercontent.com/document'})),
+            Mock(status=200, body=Mock(return_value=pdf)),
+            Mock(status=200, json=Mock(return_value={'download_url': 'https://files.oaiusercontent.com/signature'})),
+            Mock(status=200, body=Mock(return_value=signature)),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            source = export_payload(context, 'secret', data, 'test', Path(directory), lambda *a, **kw: None)
+            files = source['provenance']['fileAttachments']
+            for entry, original in zip(files, (pdf, signature)):
+                self.assertEqual(entry['messageId'], 'u')
+                self.assertEqual(Path(entry['path']).read_bytes(), original)
+                self.assertEqual(Path(entry['path']).parent.name, hashlib.sha256(original).hexdigest())
+                self.assertEqual(Path(entry['path']).name, entry['name'])
+                self.assertIn(entry['path'], '\n'.join(p['text'] for p in source['turns'][0]['items'][0]['content']))
+            self.assertEqual(source['turns'][0]['items'][1]['text'], 'Answer')
+            content = source['turns'][0]['items'][0]['content']
+            self.assertTrue(content[0]['text'].startswith('# Files mentioned by the user:\n'))
+            self.assertEqual(content[1:], [{'type': 'text', 'text': 'Question'}])
+        for call in context.request.get.call_args_list:
+            if call.args[0].startswith('https://files.'):
+                self.assertNotIn('headers', call.kwargs)
+
+    def test_missing_files_have_cards_without_changing_user_text_or_creating_files(self):
+        from unittest.mock import Mock
+        for status in (404, 410):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                data = payload()
+                data['mapping']['u']['message']['metadata'] = {'attachments': [
+                    {'id': 'file-pdf', 'name': 'Доверенность.pdf'}, {'id': 'file-sig', 'name': 'Доверенность.pdf.sig'}]}
+                context = Mock()
+                context.request.get.return_value = Mock(status=status)
+                result = export_payload(context, 'secret', data, 'test', Path(directory), lambda *a, **kw: None)
+                files = result['provenance']['fileAttachments']
+                self.assertEqual(len(files), 2)
+                for file in files:
+                    self.assertEqual(file['status'], 'unavailable')
+                    self.assertEqual(file['httpStatus'], status)
+                    self.assertFalse(Path(file['path']).exists())
+                    self.assertIn('## ' + file['name'] + ': ' + file['path'], result['turns'][0]['items'][0]['content'][0]['text'])
+                self.assertEqual(result['turns'][0]['items'][0]['content'][1:], [{'type': 'text', 'text': 'Question'}])
+                self.assertEqual(result['turns'][0]['startedAt'], 101)
+                self.assertEqual(result['turns'][0]['items'][1]['text'], 'Answer')
+
+    def test_auth_and_temporary_errors_do_not_become_file_placeholders(self):
+        from unittest.mock import Mock
+        for status in (401, 403, 429, 500):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                data = payload()
+                data['mapping']['u']['message']['metadata'] = {'attachments': [{'id': 'file-pdf', 'name': 'Document.pdf'}]}
+                context = Mock()
+                context.request.get.return_value = Mock(status=status)
+                with self.assertRaisesRegex(RuntimeError, 'HTTP ' + str(status)):
+                    export_payload(context, 'secret', data, 'test', Path(directory), lambda *a, **kw: None)
+                self.assertTrue((Path(directory) / 'raw.json').exists())
+                self.assertFalse((Path(directory) / 'source.json').exists())
+                self.assertFalse((Path(directory) / 'unavailable').exists())
+
+    def test_internal_pdf_page_previews_stay_in_raw_not_assistant_answer(self):
+        data = payload()
+        data['mapping']['preview'] = {'parent': 'u', 'message': {'id': 'preview', 'author': {'role': 'tool', 'name': 'file_search'},
+            'content': {'content_type': 'multimodal_text', 'parts': ['Internal PDF page previews', {'content_type': 'image_asset_pointer',
+                'asset_pointer': 'sediment://cache#file_document#p_0.page.jpg'}]}}}
+        data['mapping']['a']['parent'] = 'preview'
+        result = convert(data, 'test', lambda _: self.fail('Internal PDF page must not become a generated image'))
+        self.assertEqual(len(result['turns'][0]['items']), 2)
+        self.assertEqual(result['turns'][0]['items'][1]['text'], 'Answer')
+        self.assertEqual(result['provenance']['processCardsStoredInRaw'][0]['id'], 'preview')
+
+    def test_document_bytes_and_supported_format_are_checked(self):
+        self.assertEqual(document_suffix({'name': 'x.pdf', 'size': 5}, b'%PDF-'), '.pdf')
+        self.assertEqual(document_suffix({'name': 'x.pdf.sig', 'size': 2}, b'\x30\x00'), '.pdf.sig')
+        for attachment, data in [({'name': 'x.pdf'}, b'<html>error'),
+                                 ({'name': 'x.pdf', 'size': 500}, b'%PDF-'),
+                                 ({'name': 'x.pdf.sig'}, b''),
+                                 ({'name': '../x.pdf'}, b'%PDF-'),
+                                 ({'name': 'x.pdf\n## injected'}, b'%PDF-')]:
+            with self.subTest(attachment=attachment), self.assertRaises(ValueError):
+                document_suffix(attachment, data)
+
     def test_voice_transcripts_preserve_both_speakers_dates_and_order(self):
         data = payload()
         for node, kind in [('u', 'real_time_user_audio_video_asset_pointer'), ('a', 'audio_asset_pointer')]:
@@ -52,7 +142,7 @@ class ExportTests(unittest.TestCase):
             {'content_type': 'audio_transcription', 'text': ''}, {'content_type': 'audio_asset_pointer'}]}
         result = convert(data, 'test', lambda _: self.fail('Unexpected download'))
         self.assertEqual(result['turns'][0]['items'][1]['text'], 'Answer')
-        self.assertIn('пустая расшифровка', result['turns'][0]['items'][0]['content'][0]['text'])
+        self.assertEqual(result['turns'][0]['items'][0]['content'][0]['text'], '')
         self.assertTrue(result['provenance']['voiceTranscripts'][0]['emptyTranscription'])
 
     def test_project_listing_checks_all_pages_and_repeated_cursor(self):
