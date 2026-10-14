@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 
-from cloud_to_local_chat import build_rollout, prepare_source, restore_dates, register_project, copy_images
+from cloud_to_local_chat import build_rollout, prepare_source, restore_dates, register_project, copy_images, existing_project, reset_catalog_sync
 
 
 def source():
@@ -14,6 +14,37 @@ def source():
 
 
 class ImportTests(unittest.TestCase):
+    def test_catalog_refresh_preserves_entries_and_other_hosts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            (home / 'sqlite').mkdir()
+            database = home / 'sqlite/codex-dev.db'
+            connection = sqlite3.connect(database)
+            connection.executescript('CREATE TABLE local_thread_catalog_sync_state(host_id TEXT PRIMARY KEY,watermark_updated_at REAL,initial_build_complete INTEGER,observation_sequence INTEGER,last_full_reconciled_at INTEGER); CREATE TABLE local_thread_catalog(thread_id TEXT PRIMARY KEY,display_title TEXT);')
+            connection.executemany('INSERT INTO local_thread_catalog_sync_state VALUES(?,?,?,?,?)', [('local', 1000, 1, 42, 900), ('remote', 2000, 1, 99, 1900)])
+            connection.execute('INSERT INTO local_thread_catalog VALUES(?,?)', ('keep', 'Keep title'))
+            connection.commit()
+            result = reset_catalog_sync(home / 'backups', home)
+            self.assertTrue(Path(result['backup']).exists())
+            self.assertEqual(connection.execute("SELECT * FROM local_thread_catalog_sync_state WHERE host_id='local'").fetchone(), ('local', None, 0, 42, None))
+            self.assertEqual(connection.execute("SELECT * FROM local_thread_catalog_sync_state WHERE host_id='remote'").fetchone(), ('remote', 2000, 1, 99, 1900))
+            self.assertEqual(connection.execute('SELECT * FROM local_thread_catalog').fetchall(), [('keep', 'Keep title')])
+            self.assertTrue(reset_catalog_sync(home / 'backups', home)['alreadyRequested'])
+            connection.close()
+
+    def test_reuses_project_by_folder_not_name(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            database = root / 'state.sqlite'
+            with sqlite3.connect(database) as connection:
+                connection.executescript('CREATE TABLE projects(id TEXT,name TEXT,created_at_ms INTEGER,updated_at_ms INTEGER); CREATE TABLE project_roots(project_id TEXT,position INTEGER,path TEXT);')
+                connection.execute('INSERT INTO projects VALUES(?,?,?,?)', ('existing', 'Менталка', 100000, 110000))
+                connection.execute('INSERT INTO project_roots VALUES(?,?,?)', ('existing', 0, str(root)))
+            with patch('cloud_to_local_chat.state_database', return_value=database):
+                self.assertEqual(existing_project(root)['id'], 'existing')
+                self.assertIsNone(existing_project(root / 'different'))
+
     def test_rejects_incomplete_sources(self):
         for modify in [lambda s: s['page'].update(hasMore=True), lambda s: s['turns'][0]['items'][1].update(truncated=True), lambda s: s['turns'][0]['items'][0]['content'][0].update(truncated=True), lambda s: s['attachments'].append({'name': 'image.png'}), lambda s: s['turns'].append(deepcopy(s['turns'][0])), lambda s: s['turns'][0].update(status='failed'), lambda s: s['turns'][0].update(completedAt=1)]:
             with self.subTest(modify=modify):
@@ -146,9 +177,9 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(before[1:], after[1:len(before)])
         self.assertTrue(Path(result['backup'], 'rollout.before.jsonl').exists())
         connection = sqlite3.connect(self.home / 'state_5.sqlite')
-        dates = connection.execute("SELECT created_at_ms,updated_at_ms FROM threads WHERE id='new-thread'").fetchone()
+        dates = connection.execute("SELECT created_at_ms,updated_at_ms,recency_at,recency_at_ms FROM threads WHERE id='new-thread'").fetchone()
         connection.close()
-        self.assertEqual(dates, (999456, 1005789))
+        self.assertEqual(dates, (999456, 1005789, 2001, 2001000))
 
     def test_dates_refuse_chat_with_new_messages(self):
         with self.path.open('a') as output:

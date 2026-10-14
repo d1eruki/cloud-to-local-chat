@@ -81,7 +81,7 @@ def turn_items(turn):
                 elif part['type'] in ('localImage', 'local_image'):
                     path, mime = image_reference(part['path'])
                     encoded = base64.b64encode(path.read_bytes()).decode('ascii')
-                    content.append({'type': 'input_image', 'image_url': f'data:{mime};base64,{encoded}'})
+                    content.append({'type': 'input_image', 'image_url': f'data:{mime};base64,{encoded}', 'detail': 'original'})
                 else:
                     raise ValueError('Неподдерживаемое содержимое: ' + part['type'])
             if not content:
@@ -96,7 +96,7 @@ def turn_items(turn):
             items.append({'type': 'message', 'role': 'assistant', 'phase': 'final_answer', 'content': [{'type': 'output_text', 'text': text}]})
         else:
             raise ValueError('Неподдерживаемое сообщение: ' + item['type'])
-    if not roles or roles[0] != 'user' or 'assistant' not in roles or roles.count('user') != 1:
+    if not roles or roles[0] != 'user' or ('assistant' not in roles and not turn.get('unanswered')) or roles.count('user') != 1:
         raise ValueError('В каждом обмене нужны вопрос и ответ в этом порядке.')
     return items
 
@@ -128,7 +128,7 @@ def visible_items_to_raw(items):
                     content.append({'type': 'input_text', 'text': part['text']})
                 elif part['type'] in ('localImage', 'local_image'):
                     file, mime = image_reference(part['path'])
-                    content.append({'type': 'input_image', 'image_url': 'data:' + mime + ';base64,' + base64.b64encode(file.read_bytes()).decode('ascii')})
+                    content.append({'type': 'input_image', 'image_url': 'data:' + mime + ';base64,' + base64.b64encode(file.read_bytes()).decode('ascii'), 'detail': 'original'})
                 else:
                     raise ValueError('Неизвестное видимое содержимое: ' + part['type'])
             actual.append({'type': 'message', 'role': 'user', 'content': content})
@@ -297,7 +297,9 @@ def restore_dates(thread_id, source, data_dir, codex_home=None, expected_items=N
         revised = b''.join(lines) + b''.join((json.dumps(row, ensure_ascii=False) + '\n').encode() for row in additions)
         created = source['thread']['createdAt']
         updated = source['thread']['updatedAt']
-        values = {'created_at': int(created), 'updated_at': int(updated), 'created_at_ms': int(created * 1000), 'updated_at_ms': int(updated * 1000), 'recency_at': int(updated), 'recency_at_ms': int(updated * 1000)}
+        # recency_at управляет попаданием в боковую панель. Это не исходная
+        # дата переписки: сохраняем отметку добавления локальной копии.
+        values = {'created_at': int(created), 'updated_at': int(updated), 'created_at_ms': int(created * 1000), 'updated_at_ms': int(updated * 1000)}
         values = {k: v for k, v in values.items() if k in record.keys()}
         connection.execute('BEGIN IMMEDIATE')
         current = connection.execute('SELECT updated_at_ms FROM threads WHERE id=?', (thread_id,)).fetchone()
@@ -312,6 +314,43 @@ def restore_dates(thread_id, source, data_dir, codex_home=None, expected_items=N
             write_atomic(path, original, expected=revised)
             raise
         return {'createdAt': created, 'updatedAt': updated, 'backup': str(backup_dir)}
+    finally:
+        connection.close()
+
+
+def reset_catalog_sync(data_dir, codex_home=None):
+    """Просим приложение пересканировать историю при следующем запуске."""
+    directory = codex_directory(codex_home)
+    if desktop_running(directory):
+        return {'pending': True, 'reason': 'Каталог пересинхронизируется при закрытом приложении.'}
+    candidates = [directory / 'sqlite' / name for name in ('codex.db', 'codex-dev.db')]
+    candidates = [path for path in candidates if path.is_file()]
+    if not candidates:
+        return {'available': False}
+    if len(candidates) != 1:
+        raise ValueError('Найдены два каталога приложения; автоматический выбор запрещён.')
+    connection = sqlite3.connect(candidates[0], timeout=10)
+    connection.row_factory = sqlite3.Row
+    try:
+        record = connection.execute('SELECT * FROM local_thread_catalog_sync_state WHERE host_id=?', ('local',)).fetchone()
+        if not record:
+            raise ValueError('Не найдена отметка локального каталога.')
+        if record['watermark_updated_at'] is None and record['initial_build_complete'] == 0 and record['last_full_reconciled_at'] is None:
+            return {'available': True, 'alreadyRequested': True}
+        backup = Path(data_dir) / ('catalog-' + uuid.uuid4().hex[:8] + '.before.db')
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        destination = sqlite3.connect(backup)
+        try:
+            connection.backup(destination)
+        finally:
+            destination.close()
+        connection.execute('BEGIN IMMEDIATE')
+        current = connection.execute('SELECT * FROM local_thread_catalog_sync_state WHERE host_id=?', ('local',)).fetchone()
+        if dict(current) != dict(record):
+            raise RuntimeError('Отметка синхронизации изменилась; каталог не изменён.')
+        connection.execute('UPDATE local_thread_catalog_sync_state SET watermark_updated_at=NULL,initial_build_complete=0,last_full_reconciled_at=NULL WHERE host_id=?', ('local',))
+        connection.commit()
+        return {'available': True, 'requested': True, 'backup': str(backup.resolve())}
     finally:
         connection.close()
 
@@ -439,6 +478,29 @@ class Client:
             stream.close()
 
 
+def existing_project(project_root, codex_home=None):
+    """Ищем по указанной папке, а не по совпадению названий."""
+    database = state_database(codex_home)
+    if not database.exists():
+        return None
+    connection = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute('SELECT p.* FROM projects p JOIN project_roots r ON r.project_id=p.id WHERE r.path=?', (str(Path(project_root).resolve()),)).fetchall()
+        if len(rows) > 1:
+            raise ValueError('С указанной папкой связаны несколько проектов; устраните неоднозначность.')
+        if not rows:
+            return None
+        row = rows[0]
+        roots = connection.execute('SELECT path FROM project_roots WHERE project_id=? ORDER BY position', (row['id'],)).fetchall()
+        if len(roots) != 1:
+            raise ValueError('Перенос в проект с несколькими корнями пока не поддерживается.')
+        return {'id': row['id'], 'name': row['name'], 'roots': [{'path': r['path']} for r in roots],
+                'createdAt': row['created_at_ms'] / 1000, 'updatedAt': row['updated_at_ms'] / 1000}
+    finally:
+        connection.close()
+
+
 def migrate(source, project_root, project_name, data_dir, executable='codex', codex_home=None):
     prepare_source(source)
     project_root = Path(project_root).resolve()
@@ -457,7 +519,9 @@ def migrate(source, project_root, project_name, data_dir, executable='codex', co
     client = Client(executable, codex_home)
     receipt = {'sourceId': source['thread']['id'], 'status': 'creating'}
     try:
-        project = client.rpc('project/create', {'idempotencyKey': 'cloud-to-local-' + hashlib.sha256(str(project_root).encode()).hexdigest(), 'name': project_name, 'roots': [{'path': str(project_root)}]})['project']
+        project = existing_project(project_root, codex_home)
+        if project is None:
+            project = client.rpc('project/create', {'idempotencyKey': 'cloud-to-local-' + hashlib.sha256(str(project_root).encode()).hexdigest(), 'name': project_name, 'roots': [{'path': str(project_root)}]})['project']
         thread = client.rpc('thread/start', {'cwd': str(project_root), 'projectId': project['id'], 'historyMode': 'paginated', 'ephemeral': False, 'threadSource': 'user'})['thread']
         receipt.update(project=project, threadId=thread['id'], path=thread['path'], images=images, provenance=source.get('provenance', {}))
         receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
@@ -499,14 +563,102 @@ def migrate(source, project_root, project_name, data_dir, executable='codex', co
         client.close()
     receipt['dates'] = restore_dates(thread['id'], source, data_dir, codex_home, expected_items=items)
     receipt['registration'] = register_project(project, thread['id'], data_dir, codex_home)
+    if not receipt['registration'].get('pending'):
+        receipt['catalog'] = reset_catalog_sync(data_dir, codex_home)
     receipt['status'] = 'prepared'
     receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
     return receipt
 
 
+def transfer_project(project_id, project_root, auth_data, executable='codex', codex_home=None):
+    from cloud_export import chrome_executable, manual_login, snapshot_profile, http_get, list_project_chats, export_payload
+    from playwright.sync_api import sync_playwright
+    root = Path(project_root).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError('Папка проекта должна существовать.')
+    report_path = root / 'import-report.json'
+    report = json.loads(report_path.read_text()) if report_path.exists() else {'cloudProjectId': project_id, 'entries': {}}
+    if report.get('cloudProjectId') != project_id:
+        raise ValueError('В этой папке уже есть отчёт другого облачного проекта.')
+    profile = Path(auth_data).resolve() / 'browser-profile'
+    manual_login(profile, 'https://chatgpt.com', print)
+    background = snapshot_profile(profile)
+    def save():
+        write_atomic(report_path, json.dumps(report, ensure_ascii=False, indent=2).encode())
+    with sync_playwright() as runtime:
+        context = runtime.chromium.launch_persistent_context(str(background), executable_path=chrome_executable(),
+                    headless=True, ignore_default_args=['--use-mock-keychain', '--password-store=basic'])
+        try:
+            session = http_get(context, 'https://chatgpt.com/api/auth/session', timeout=20000)
+            if session.status != 200 or not (token := session.json().get('accessToken')):
+                raise RuntimeError('Сессия входа недоступна.')
+            catalog = list_project_chats(context, token, project_id)
+            report['catalog'] = catalog
+            save()
+            for index, item in enumerate(catalog, 1):
+                identifier = item['id']
+                entry = report['entries'].setdefault(identifier, {'title': item['title']})
+                print(f'[{index}/{len(catalog)}] {item["title"]}', flush=True)
+                if entry.get('status') in ('prepared', 'existing'):
+                    print('  Уже перенесён; повторный импорт не запускается.', flush=True)
+                    continue
+                output = root / 'chats' / identifier
+                try:
+                    source_path = output / 'source.json'
+                    if source_path.exists():
+                        source = json.loads(source_path.read_text())
+                        prepare_source(source)
+                    else:
+                        raw_path = output / 'raw.json'
+                        if raw_path.exists():
+                            payload = json.loads(raw_path.read_text())
+                        else:
+                            response = http_get(context, 'https://chatgpt.com/backend-api/conversation/' + identifier,
+                                headers={'Authorization': 'Bearer ' + token}, timeout=30000, max_redirects=0)
+                            if response.status != 200:
+                                raise RuntimeError('История недоступна (HTTP ' + str(response.status) + ').')
+                            payload = response.json()
+                        source = export_payload(context, token, payload, identifier, output)
+                    entry.update(sourcePath=str(source_path), status='downloaded',
+                        processCardsStoredInRaw=source.get('provenance', {}).get('processCardsStoredInRaw', []))
+                    save()
+                    if entry.get('existingThreadId'):
+                        client = Client(executable, codex_home)
+                        try:
+                            turns = client.rpc('thread/resume', {'threadId': entry['existingThreadId']})['thread']['turns']
+                            actual = visible_items_to_raw([i for t in turns for i in t['items']])
+                            expected = prepare_source(source)
+                            if actual[:len(expected)] != expected:
+                                raise ValueError('Существующий локальный чат не совпадает с исходником; дубль не создан.')
+                        finally:
+                            client.close()
+                        entry.update(status='existing', threadId=entry['existingThreadId'])
+                    else:
+                        receipt = migrate(source, root, root.name, root / 'chats' / 'receipts', executable, codex_home)
+                        entry.update(status=receipt['status'], threadId=receipt['threadId'], registration=receipt['registration'], messageCount=receipt['messageCount'])
+                        if receipt['registration'].get('pending'):
+                            request_path = Path(receipt['registration']['request'])
+                            request = json.loads(request_path.read_text())
+                            request['sourcePath'] = str(source_path)
+                            write_atomic(request_path, json.dumps(request, ensure_ascii=False, indent=2).encode())
+                    entry.pop('error', None)
+                    print('  История сверена, локальный чат готов.', flush=True)
+                except Exception as error:
+                    entry.update(status='error', error=str(error))
+                    print('  Не перенесён: ' + str(error), flush=True)
+                save()
+        finally:
+            context.close()
+    report['summary'] = {status: sum(e.get('status') == status for e in report['entries'].values()) for status in ('prepared', 'existing', 'error')}
+    save()
+    return report['summary']
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source', nargs='?', type=Path, help='Полный JSON ответа read_thread')
+    parser.add_argument('--chat-url', help='Получить чат из ChatGPT после входа в отдельном браузере')
+    parser.add_argument('--project-id', help='Перенести чаты облачного проекта g-p-… по очереди')
     parser.add_argument('--project-root', type=Path)
     parser.add_argument('--project-name')
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
@@ -515,7 +667,21 @@ def main():
     parser.add_argument('--apply', action='store_true', help='Создать локальный чат; без флага только проверка источника')
     parser.add_argument('--register-request', type=Path, nargs='+', help='Завершить привязку проектов после закрытия приложения')
     parser.add_argument('--wait-for-app-exit', action='store_true', help='Дождаться закрытия приложения для записи реестра (до 15 минут)')
+    parser.add_argument('--refresh-catalog', action='store_true', help='Запросить полную пересинхронизацию локального каталога при закрытом приложении')
     args = parser.parse_args()
+    if args.refresh_catalog:
+        if not args.apply or args.register_request or args.source or args.chat_url or args.project_id:
+            parser.error('Для пересинхронизации используйте --refresh-catalog --apply без источников.')
+        if args.wait_for_app_exit:
+            print('Ожидание полного выхода из ChatGPT/Codex для пересинхронизации каталога.', flush=True)
+            deadline = time.monotonic() + 900
+            while desktop_running(codex_directory(args.codex_home)):
+                if time.monotonic() > deadline:
+                    raise TimeoutError('Приложение не закрыто за 15 минут; каталог не изменён.')
+                time.sleep(0.5)
+            time.sleep(2)
+        print(json.dumps(reset_catalog_sync(args.data_dir, args.codex_home), ensure_ascii=False, indent=2), flush=True)
+        return
     if args.register_request:
         if not args.apply:
             parser.error('Для записи реестра добавьте --apply.')
@@ -539,16 +705,32 @@ def main():
                 request['registration'] = result
                 request['status'] = 'registered'
                 request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2))
-        print(json.dumps({'registrations': results, 'status': 'pending' if any(result.get('pending') for result in results) else 'registered'}, ensure_ascii=False, indent=2), flush=True)
+        pending = any(result.get('pending') for result in results)
+        catalog = None if pending else reset_catalog_sync(args.data_dir, requests[0]['codexHome'])
+        print(json.dumps({'registrations': results, 'status': 'pending' if pending else 'registered', 'catalog': catalog}, ensure_ascii=False, indent=2), flush=True)
         return
-    if not args.source or not args.project_root or not args.project_name:
-        parser.error('Укажите источник, --project-root и --project-name.')
-    source = json.loads(args.source.read_text())
+    if args.project_id:
+        if args.source or args.chat_url or not args.project_root or not args.apply:
+            parser.error('Для проекта укажите --project-id, существующую --project-root и --apply, без других источников.')
+        print(json.dumps(transfer_project(args.project_id, args.project_root, args.data_dir, args.codex, args.codex_home), ensure_ascii=False))
+        return
+    if bool(args.source) == bool(args.chat_url) or not args.project_root:
+        parser.error('Укажите ровно один источник: файл или --chat-url, и --project-root.')
+    if args.chat_url:
+        if not args.project_root.is_dir():
+            parser.error('--project-root должна указывать на существующую папку. Папки автоматически не создаются.')
+        from cloud_export import export_chat
+        source = export_chat(args.chat_url, args.data_dir)
+    else:
+        source = json.loads(args.source.read_text())
+    project_name = args.project_name or args.project_root.resolve().name
     items = prepare_source(source)
     if not args.apply:
         print(json.dumps({'sourceId': source['thread']['id'], 'messages': len(items), 'mode': 'preview'}, ensure_ascii=False))
         return
-    print(json.dumps(migrate(source, args.project_root, args.project_name, args.data_dir, args.codex, args.codex_home), ensure_ascii=False, indent=2))
+    if args.chat_url:
+        print('[4/4] Создание локального чата и привязка к указанной папке.', flush=True)
+    print(json.dumps(migrate(source, args.project_root, project_name, args.data_dir, args.codex, args.codex_home), ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':
