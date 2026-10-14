@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+/data/
+/work/
+/outputs/
+/backups/
+/images/
+/ideas/
+*.jsonl
+/.idea/
