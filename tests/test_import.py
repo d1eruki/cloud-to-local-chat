@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 
-from cloud_to_local_chat import build_rollout, prepare_source, restore_dates, register_project, copy_images, copy_files, existing_project, reset_catalog_sync
+from cloud_to_local_chat import build_rollout, prepare_source, restore_dates, register_project, copy_images, copy_files, existing_project, reset_catalog_sync, injected_items
 
 
 def source():
@@ -14,6 +14,44 @@ def source():
 
 
 class ImportTests(unittest.TestCase):
+    def test_assistant_file_link_moves_with_the_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            original = root / 'icon.svg'
+            original.write_bytes(b'<svg/>')
+            data = source()
+            answer = data['turns'][0]['items'][1]
+            answer.update(id='a', text='[Download](<' + str(original) + '>)')
+            data['provenance'] = {'fileAttachments': [{'messageId': 'a', 'id': 'file_sandbox_one', 'name': 'icon.svg',
+                'path': str(original), 'status': 'available', 'placement': 'assistant-link'}]}
+            normalized = copy_files(data, root / 'project')
+            target = normalized['provenance']['fileAttachments'][0]['path']
+            self.assertEqual(Path(target).read_bytes(), original.read_bytes())
+            self.assertEqual(normalized['turns'][0]['items'][1]['text'], '[Download](<' + target + '>)')
+            self.assertEqual(normalized['turns'][0]['items'][0], data['turns'][0]['items'][0])
+
+    def test_backend_jpeg_downscale_is_recorded_but_other_changes_are_rejected(self):
+        def jpeg(width, height):
+            data = b'\xff\xd8\xff\xc0\x00\x11\x08' + height.to_bytes(2, 'big') + width.to_bytes(2, 'big') + b'\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00\xff\xd9'
+            return 'data:image/jpeg;base64,' + base64.b64encode(data).decode()
+        expected = [{'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Original'},
+                     {'type': 'input_image', 'image_url': jpeg(3000, 4000), 'detail': 'original'}]}]
+        actual = deepcopy(expected)
+        actual[0]['content'][1]['image_url'] = jpeg(2700, 3600)
+        rows = [{'type': 'response_item', 'payload': actual[0]}]
+        preserved, processing = injected_items(rows, expected)
+        self.assertEqual(preserved, actual)
+        self.assertEqual(processing[0]['contextDimensions'], (2700, 3600))
+        self.assertEqual(expected[0]['content'][1]['image_url'], jpeg(3000, 4000))
+        for change in (lambda v: v['content'][0].update(text='Different'),
+                       lambda v: v['content'][1].update(image_url=jpeg(3600, 2700)),
+                       lambda v: v['content'][1].update(detail='low'),
+                       lambda v: v['content'][1].update(image_url='https://example.test/image.jpg')):
+            corrupted = deepcopy(actual[0])
+            change(corrupted)
+            with self.assertRaises(ValueError):
+                injected_items([{'type': 'response_item', 'payload': corrupted}], expected)
+
     def test_file_cards_follow_project_files_and_missing_files_stay_missing(self):
         import hashlib
         with tempfile.TemporaryDirectory() as directory:
@@ -71,6 +109,17 @@ class ImportTests(unittest.TestCase):
             with patch('cloud_to_local_chat.state_database', return_value=database):
                 self.assertEqual(existing_project(root)['id'], 'existing')
                 self.assertIsNone(existing_project(root / 'different'))
+                with sqlite3.connect(database) as connection:
+                    connection.execute('INSERT INTO projects VALUES(?,?,?,?)', ('multi', 'Другой проект', 100000, 110000))
+                    connection.executemany('INSERT INTO project_roots VALUES(?,?,?)', [('multi', 0, str(root / 'child')), ('multi', 1, str(root))])
+                self.assertEqual(existing_project(root)['id'], 'existing')
+                with self.assertRaisesRegex(ValueError, 'несколькими корнями'):
+                    existing_project(root / 'child')
+                with sqlite3.connect(database) as connection:
+                    connection.execute('INSERT INTO projects VALUES(?,?,?,?)', ('duplicate', 'Дубликат', 100000, 110000))
+                    connection.execute('INSERT INTO project_roots VALUES(?,?,?)', ('duplicate', 0, str(root)))
+                with self.assertRaisesRegex(ValueError, 'несколько проектов'):
+                    existing_project(root)
 
     def test_rejects_incomplete_sources(self):
         for modify in [lambda s: s['page'].update(hasMore=True), lambda s: s['turns'][0]['items'][1].update(truncated=True), lambda s: s['turns'][0]['items'][0]['content'][0].update(truncated=True), lambda s: s['attachments'].append({'name': 'image.png'}), lambda s: s['turns'].append(deepcopy(s['turns'][0])), lambda s: s['turns'][0].update(status='failed'), lambda s: s['turns'][0].update(completedAt=1)]:

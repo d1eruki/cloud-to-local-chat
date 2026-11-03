@@ -2,7 +2,7 @@ import unittest
 from contextlib import closing
 import tempfile
 from pathlib import Path
-from cloud_export import active_messages, chat_id, convert, image_suffix, allowed_asset_url, manual_login, has_login, snapshot_profile, http_get, list_project_chats, document_suffix, export_payload
+from cloud_export import active_messages, chat_id, convert, image_suffix, allowed_asset_url, manual_login, has_login, snapshot_profile, http_get, list_project_chats, document_suffix, export_payload, fetch_asset
 
 
 def payload():
@@ -17,6 +17,63 @@ def payload():
 
 
 class ExportTests(unittest.TestCase):
+    def test_library_download_keeps_auth_on_chatgpt_only(self):
+        from unittest.mock import Mock
+        context = Mock()
+        context.request.get.side_effect = [Mock(status=302, headers={'location': 'https://files.oaiusercontent.com/file'}), Mock(status=200)]
+        response = fetch_asset(context, 'secret', '/api/library/files/libfile_one/project-content')
+        self.assertEqual(response.status, 200)
+        self.assertEqual(context.request.get.call_args_list[0].kwargs['headers'], {'Authorization': 'Bearer secret'})
+        self.assertNotIn('headers', context.request.get.call_args_list[1].kwargs)
+        context.request.get.side_effect = [Mock(status=302, headers={'location': 'https://evil.test/file'})]
+        with self.assertRaises(ValueError):
+            fetch_asset(context, 'secret', '/api/library/files/libfile_one/project-content')
+        with self.assertRaises(ValueError):
+            fetch_asset(context, 'secret', '//evil.test/file')
+
+    def test_project_image_uses_context_resolver_when_direct_link_is_denied(self):
+        from unittest.mock import Mock
+        data = payload()
+        data['gizmo_id'] = 'g-p-test'
+        data['mapping']['u']['message']['content'] = {'content_type': 'multimodal_text', 'parts': [
+            'Question', {'content_type': 'image_asset_pointer', 'asset_pointer': 'sediment://file-image'}]}
+        context = Mock()
+        context.request.get.side_effect = [Mock(status=403),
+            Mock(status=200, json=Mock(return_value={'download_url': 'https://files.oaiusercontent.com/image'})),
+            Mock(status=200, body=Mock(return_value=b'\x89PNG\r\n\x1a\n'))]
+        with tempfile.TemporaryDirectory() as directory:
+            result = export_payload(context, 'secret', data, 'test', Path(directory), lambda *a, **kw: None)
+            self.assertEqual(result['turns'][0]['items'][0]['content'][0]['text'], 'Question')
+            query = context.request.get.call_args_list[1].kwargs['params']
+            self.assertEqual(query['conversation_id'], 'test')
+            self.assertEqual(query['gizmo_id'], 'g-p-test')
+            self.assertNotIn('headers', context.request.get.call_args_list[2].kwargs)
+
+    def test_sandbox_output_is_downloaded_and_linked_without_added_prose(self):
+        from unittest.mock import Mock
+        data = payload()
+        data['mapping']['a']['message']['content']['parts'] = ['[Download](sandbox:/mnt/data/icon.svg)']
+        context = Mock()
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
+        context.request.get.side_effect = [Mock(status=200, json=Mock(return_value={'download_url': 'https://files.oaiusercontent.com/icon'})),
+                                          Mock(status=200, body=Mock(return_value=svg))]
+        with tempfile.TemporaryDirectory() as directory:
+            result = export_payload(context, 'secret', data, 'test', Path(directory), lambda *a, **kw: None)
+            file = result['provenance']['fileAttachments'][0]
+            self.assertEqual(Path(file['path']).read_bytes(), svg)
+            self.assertEqual(file['placement'], 'assistant-link')
+            self.assertEqual(result['turns'][0]['items'][1]['text'], '[Download](<' + file['path'] + '>)')
+            self.assertEqual(context.request.get.call_args_list[0].kwargs['params'], {'message_id': 'a', 'sandbox_path': '/mnt/data/icon.svg'})
+
+    def test_internal_execution_and_empty_tool_outputs_stay_in_raw(self):
+        for content in ({'content_type': 'execution_output', 'text': 'Internal'}, {'content_type': 'multimodal_text', 'parts': []}):
+            data = payload()
+            data['mapping']['tool'] = {'parent': 'u', 'message': {'id': 'tool', 'author': {'role': 'tool'}, 'content': content}}
+            data['mapping']['a']['parent'] = 'tool'
+            result = convert(data, 'test', lambda _: self.fail('Unexpected image'))
+            self.assertEqual(len(result['turns'][0]['items']), 2)
+            self.assertEqual(result['provenance']['processCardsStoredInRaw'][0]['id'], 'tool')
+
     def test_pdf_and_signature_are_saved_and_linked_to_original_question(self):
         import hashlib
         from unittest.mock import Mock

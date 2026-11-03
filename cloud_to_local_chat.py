@@ -144,6 +144,64 @@ def utc_stamp(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
 
+def _jpeg_size(data):
+    if not data.startswith(b'\xff\xd8') or not data.endswith(b'\xff\xd9'):
+        return None
+    position = 2
+    while position + 4 <= len(data):
+        if data[position] != 255:
+            return None
+        marker = data[position + 1]
+        length = int.from_bytes(data[position + 2:position + 4], 'big')
+        if length < 2 or position + length + 2 > len(data):
+            return None
+        if marker in (192, 193, 194) and length >= 8:
+            return int.from_bytes(data[position + 7:position + 9], 'big'), int.from_bytes(data[position + 5:position + 7], 'big')
+        if marker == 218:
+            return None
+        position += length + 2
+    return None
+
+
+def injected_items(rows, expected):
+    """Учитывает уменьшение JPEG сервером; оригиналы для отображения остаются в source."""
+    tail = rows[-len(expected):]
+    if len(tail) != len(expected) or any(r['type'] != 'response_item' for r in tail):
+        raise ValueError('Неожиданный конец журнала; правка запрещена.')
+    actual = [r['payload'] for r in tail]
+    comparison = deepcopy(actual)
+    processed = []
+    for n, (found, wanted) in enumerate(zip(comparison, expected)):
+        if found.get('role') != 'user' or wanted.get('role') != 'user':
+            continue
+        for k, (part, original) in enumerate(zip(found.get('content', []), wanted.get('content', []))):
+            if part == original or part.get('type') != 'input_image' or original.get('type') != 'input_image':
+                continue
+            urls = [original.get('image_url', ''), part.get('image_url', '')]
+            if not all(u.startswith('data:image/jpeg;base64,') for u in urls):
+                continue
+            try:
+                data = [base64.b64decode(u.split(',', 1)[1], validate=True) for u in urls]
+            except ValueError:
+                continue
+            sizes = [_jpeg_size(d) for d in data]
+            if not all(size and min(size) > 0 for size in sizes):
+                continue
+            (ow, oh), (nw, nh) = sizes
+            if nw > ow or nh > oh or abs(nw / ow - nh / oh) > max(1 / ow, 1 / oh):
+                continue
+            normalized = {**part, 'image_url': original['image_url']}
+            if normalized != original:
+                continue
+            found['content'][k] = normalized
+            processed.append({'messageIndex': n, 'contentIndex': k, 'sourceDimensions': sizes[0], 'contextDimensions': sizes[1],
+                              'sourceSha256': hashlib.sha256(data[0]).hexdigest(), 'contextSha256': hashlib.sha256(data[1]).hexdigest()})
+    keys = ('type', 'role', 'content', 'phase')
+    if any(any(found.get(k) != wanted.get(k) for k in keys) for found, wanted in zip(comparison, expected)):
+        raise ValueError('Неожиданный конец журнала; правка запрещена.')
+    return actual, processed
+
+
 def build_rollout(rows, source, thread_id, items):
     result = deepcopy(rows)
     if not result or result[0].get('type') != 'session_meta' or result[0]['payload'].get('id') != thread_id:
@@ -250,7 +308,15 @@ def copy_files(source, project_root):
         found = False
         for turn in result['turns']:
             for item in turn['items']:
-                if item.get('id') != file['messageId'] or item['type'] != 'userMessage':
+                if item.get('id') != file['messageId']:
+                    continue
+                if file.get('placement') == 'assistant-link' and item['type'] == 'agentMessage':
+                    old_link, new_link = '](<' + str(original) + '>)', '](<' + str(target) + '>)'
+                    if old_link in item.get('text', ''):
+                        item['text'] = item['text'].replace(old_link, new_link)
+                        found = True
+                    continue
+                if item['type'] != 'userMessage':
                     continue
                 for part in item['content']:
                     if part.get('type') == 'text' and part['text'].startswith('# Files mentioned by the user:\n') and old_card in part['text'].splitlines():
@@ -533,7 +599,11 @@ def existing_project(project_root, codex_home=None):
     try:
         rows = connection.execute('SELECT p.* FROM projects p JOIN project_roots r ON r.project_id=p.id WHERE r.path=?', (str(Path(project_root).resolve()),)).fetchall()
         if len(rows) > 1:
-            raise ValueError('С указанной папкой связаны несколько проектов; устраните неоднозначность.')
+            single_root = [row for row in rows if connection.execute(
+                'SELECT COUNT(*) FROM project_roots WHERE project_id=?', (row['id'],)).fetchone()[0] == 1]
+            if len(single_root) != 1:
+                raise ValueError('С указанной папкой связаны несколько проектов; устраните неоднозначность.')
+            rows = single_root
         if not rows:
             return None
         row = rows[0]
@@ -581,7 +651,9 @@ def migrate(source, project_root, project_name, data_dir, executable='codex', co
     backup = data_dir / (identity + '.before.jsonl')
     backup.write_text(original)
     rows = [json.loads(line) for line in original.splitlines()]
-    revised = build_rollout(rows, source, thread['id'], items)
+    injected, processed_images = injected_items(rows, items)
+    receipt['contextImageProcessing'] = processed_images
+    revised = build_rollout(rows, source, thread['id'], injected)
     replacement = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, prefix=path.name + '.', suffix='.importing', delete=False) as output:

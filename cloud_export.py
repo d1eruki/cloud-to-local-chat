@@ -10,7 +10,7 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 
 def chat_id(url):
@@ -44,6 +44,28 @@ def convert(payload, identifier, get_image, get_file=None):
     """Выбирает текущую ветку; не переносит скрытые сообщения и старые варианты."""
     turns, turn, process_cards, voice_transcripts = [], None, [], []
     file_attachments = []
+    def resolve_file(attachment, message_id):
+        document_suffix(attachment)
+        if get_file is None:
+            raise ValueError('Для вложенного документа требуется скачивание оригинала.')
+        result = get_file(attachment)
+        if not isinstance(result, dict):
+            result = {'path': str(result), 'status': 'available'}
+        if result.get('status') not in ('available', 'unavailable'):
+            raise ValueError('Неизвестный статус вложения.')
+        unavailable = result['status'] == 'unavailable'
+        path = Path(result['path']).resolve(strict=not unavailable)
+        if unavailable and path.exists():
+            raise ValueError('Путь недоступного файла уже существует.')
+        record = {**result, 'messageId': message_id, 'id': attachment['id'],
+                  'name': attachment['name'], 'mimeType': attachment.get('mime_type'),
+                  'sourceSize': attachment.get('size'), 'path': str(path)}
+        if attachment.get('sandbox_path'):
+            record['placement'] = 'assistant-link'
+            record['sandboxPath'] = attachment['sandbox_path']
+        if not any(f['messageId'] == message_id and f['id'] == record['id'] for f in file_attachments):
+            file_attachments.append(record)
+        return record
     for message in active_messages(payload, identifier):
         role = message.get('author', {}).get('role')
         metadata = message.get('metadata', {})
@@ -57,7 +79,9 @@ def convert(payload, identifier, get_image, get_file=None):
             # Вызов генератора не является видимым ответом. Его результат ниже
             # должен быть изображением; другие результаты отклоняются.
             continue
-        if (role == 'assistant' and kind in ('reasoning_recap', 'thoughts')) or (role == 'tool' and kind in ('text', 'tether_quote', 'tether_browsing_display')):
+        if ((role == 'assistant' and kind in ('reasoning_recap', 'thoughts'))
+                or (role == 'tool' and kind in ('text', 'tether_quote', 'tether_browsing_display', 'execution_output'))
+                or (role == 'tool' and kind == 'multimodal_text' and not content.get('parts'))):
             # Отдельные карточки процесса остаются в полном raw.json.
             # В диалог импортируются вопросы и ответы; пропуск фиксируется.
             process_cards.append({'id': message['id'], 'contentType': kind})
@@ -80,6 +104,17 @@ def convert(payload, identifier, get_image, get_file=None):
         empty_transcription = False
         for part in content.get('parts', []):
             if isinstance(part, str):
+                if role == 'assistant' and 'sandbox:/' in part:
+                    def sandbox_link(match):
+                        sandbox_path = match.group(2)[len('sandbox:'):]
+                        attachment = {'id': 'file_sandbox_' + hashlib.sha256((identifier + message['id'] + sandbox_path).encode()).hexdigest()[:24],
+                                      'name': Path(sandbox_path).name, 'sandbox_path': sandbox_path, 'message_id': message['id']}
+                        file = resolve_file(attachment, message['id'])
+                        return match.group(1) + '<' + file['path'] + '>)'
+                    chunks = part.split('```')
+                    for n in range(0, len(chunks), 2):
+                        chunks[n] = re.sub(r'(\[[^\]\n]*\]\()(sandbox:/[^\n)]+)\)', sandbox_link, chunks[n])
+                    part = '```'.join(chunks)
                 parts.append({'type': 'text', 'text': part})
             elif isinstance(part, dict) and part.get('content_type') == 'image_asset_pointer':
                 images.append(get_image(part['asset_pointer']))
@@ -110,22 +145,10 @@ def convert(payload, identifier, get_image, get_file=None):
                 if str(attachment.get('mime_type', '')).startswith('image/'):
                     image_attachments += 1
                     continue
-                document_suffix(attachment)
-                if role != 'user' or get_file is None:
+                if role != 'user':
                     raise ValueError('Для вложенного документа требуется скачивание оригинала.')
-                result = get_file(attachment)
-                if not isinstance(result, dict):
-                    result = {'path': str(result), 'status': 'available'}
-                if result.get('status') not in ('available', 'unavailable'):
-                    raise ValueError('Неизвестный статус вложения.')
-                unavailable = result['status'] == 'unavailable'
-                path = Path(result['path']).resolve(strict=not unavailable)
-                if unavailable and path.exists():
-                    raise ValueError('Путь недоступного файла уже существует.')
-                file_cards.append('## ' + attachment['name'] + ': ' + str(path))
-                file_attachments.append({**result, 'messageId': message['id'], 'id': attachment['id'],
-                                         'name': attachment['name'], 'mimeType': attachment.get('mime_type'),
-                                         'sourceSize': attachment.get('size'), 'path': str(path)})
+                file = resolve_file(attachment, message['id'])
+                file_cards.append('## ' + attachment['name'] + ': ' + file['path'])
             if image_attachments > len(images):
                 raise ValueError('Не все вложения сопоставлены с оригиналами изображений.')
             if file_cards:
@@ -208,6 +231,27 @@ def allowed_asset_url(url):
     return parsed.scheme == 'https' and not parsed.username and not parsed.password and (
         host == 'chatgpt.com' or host.endswith('.oaiusercontent.com') or
         host.endswith('.openai.com') or host.endswith('.blob.core.windows.net'))
+
+
+def fetch_asset(context, token, url):
+    if url.startswith('/') and not url.startswith('//') and re.fullmatch(
+            r'/api/library/files/[a-zA-Z0-9_-]+/(?:content|download|thumbnail|project-content)', urlparse(url).path):
+        url = 'https://chatgpt.com' + url
+    for _ in range(4):
+        if not allowed_asset_url(url):
+            raise ValueError('Неизвестный адрес сервера вложений; файл не скачан.')
+        parsed = urlparse(url)
+        options = {'max_redirects': 0, 'timeout': 120000}
+        if parsed.hostname == 'chatgpt.com' and parsed.path.startswith(('/api/library/', '/backend-api/')):
+            options['headers'] = {'Authorization': 'Bearer ' + token}
+        response = http_get(context, url, **options)
+        if response.status not in (301, 302, 303, 307, 308):
+            return response
+        location = response.headers.get('location')
+        if not location:
+            raise ValueError('В ответе сервера вложений отсутствует адрес файла.')
+        url = urljoin(url, location)
+    raise ValueError('Сервер вложений повторяет перенаправления.')
 
 
 def chrome_executable():
@@ -387,9 +431,19 @@ def export_payload(context, token, payload, identifier, output, progress=print):
             cache[key] = result
             progress('  Файл недоступен (HTTP ' + str(status) + '); сохранена карточка вложения.', flush=True)
             return result
-        resolver = http_get(context, 'https://chatgpt.com/backend-api/files/' + identifier + '/download',
-                            headers={'Authorization': 'Bearer ' + token}, max_redirects=0)
-        if resolver.status == 404:
+        if attachment.get('sandbox_path'):
+            headers = {'Authorization': 'Bearer ' + token}
+            project = payload.get('gizmo_id')
+            if project and project.startswith('g-p-'):
+                headers['chatgpt-project-id'] = project
+            resolver = http_get(context, 'https://chatgpt.com/backend-api/conversation/'
+                                + payload.get('conversation_id', payload.get('id')) + '/interpreter/download',
+                                headers=headers, max_redirects=0,
+                                params={'message_id': attachment['message_id'], 'sandbox_path': attachment['sandbox_path']})
+        else:
+            resolver = http_get(context, 'https://chatgpt.com/backend-api/files/' + identifier + '/download',
+                                headers={'Authorization': 'Bearer ' + token}, max_redirects=0)
+        if resolver.status == 404 and not attachment.get('sandbox_path'):
             resolver = http_get(context, 'https://chatgpt.com/backend-api/files/download/' + identifier,
                                 headers={'Authorization': 'Bearer ' + token}, max_redirects=0,
                                 params={'conversation_id': payload.get('conversation_id', payload.get('id')),
@@ -399,9 +453,7 @@ def export_payload(context, token, payload, identifier, output, progress=print):
         if resolver.status != 200:
             raise RuntimeError('Оригинал документа недоступен (HTTP ' + str(resolver.status) + '). Перенос остановлен.')
         asset_url = resolver.json().get('download_url', '')
-        if not allowed_asset_url(asset_url):
-            raise ValueError('Неизвестный адрес сервера документов; файл не скачан.')
-        response = http_get(context, asset_url, max_redirects=0, timeout=120000)
+        response = fetch_asset(context, token, asset_url)
         if response.status in (404, 410):
             return unavailable(response.status)
         if response.status != 200:
@@ -425,13 +477,16 @@ def export_payload(context, token, payload, identifier, output, progress=print):
             raise ValueError('Неподдерживаемая ссылка на оригинал изображения.')
         resolver = http_get(context, 'https://chatgpt.com/backend-api/files/' + match.group(1) + '/download',
                                        headers={'Authorization': 'Bearer ' + token}, max_redirects=0)
+        if resolver.status in (403, 404):
+            resolver = http_get(context, 'https://chatgpt.com/backend-api/files/download/' + match.group(1),
+                                headers={'Authorization': 'Bearer ' + token}, max_redirects=0,
+                                params={'conversation_id': identifier, 'gizmo_id': payload.get('gizmo_id'),
+                                        'download_intent': 'false', 'inline': 'true'})
         if resolver.status != 200:
             raise RuntimeError('Оригинал изображения недоступен (HTTP ' + str(resolver.status) + '). Перенос остановлен.')
         asset_url = resolver.json().get('download_url', '')
-        if not allowed_asset_url(asset_url):
-            raise ValueError('Неизвестный адрес сервера изображений; файл не скачан.')
         # Bearer-токен передаётся только ChatGPT, не серверу хранения.
-        response = http_get(context, asset_url, max_redirects=0, timeout=120000)
+        response = fetch_asset(context, token, asset_url)
         if response.status != 200:
             raise RuntimeError('Не удалось скачать изображение (HTTP ' + str(response.status) + ').')
         data = response.body()
