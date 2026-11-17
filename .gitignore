@@ -9,3 +9,11 @@ __pycache__/
 /ideas/
 *.jsonl
 /.idea/
+
+node_modules/
+.venv/
+venv/
+.pytest_cache/
+.env
+.env.*
+!.env.example

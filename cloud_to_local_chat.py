@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 from copy import deepcopy
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -411,6 +412,10 @@ def restore_dates(thread_id, source, data_dir, codex_home=None, expected_items=N
         # recency_at управляет попаданием в боковую панель. Это не исходная
         # дата переписки: сохраняем отметку добавления локальной копии.
         values = {'created_at': int(created), 'updated_at': int(updated), 'created_at_ms': int(created * 1000), 'updated_at_ms': int(updated * 1000)}
+        first_question = next(i for t in source['turns'] for i in t['items'] if i['type'] == 'userMessage')
+        preview = '\n'.join(c.get('text', '') for c in first_question['content'] if c.get('type') == 'text')
+        values.update(has_user_event=1, title=source['thread']['title'],
+                      first_user_message=preview, preview=preview)
         values = {k: v for k, v in values.items() if k in record.keys()}
         connection.execute('BEGIN IMMEDIATE')
         current = connection.execute('SELECT updated_at_ms FROM threads WHERE id=?', (thread_id,)).fetchone()
@@ -429,18 +434,53 @@ def restore_dates(thread_id, source, data_dir, codex_home=None, expected_items=N
         connection.close()
 
 
-def reset_catalog_sync(data_dir, codex_home=None):
+def catalog_database(codex_home=None, catalog_path=None):
+    directory = codex_directory(codex_home)
+    allowed = [directory / 'sqlite' / name for name in ('codex.db', 'codex-dev.db')]
+    if catalog_path is not None:
+        selected = Path(catalog_path).resolve(strict=True)
+        if selected not in [p.resolve() for p in allowed]:
+            raise ValueError('--catalog-path должна указывать на codex.db или codex-dev.db этого хранилища.')
+        return selected
+    candidates = [p for p in allowed if p.is_file()]
+    if len(candidates) > 1:
+        raise ValueError('Найдены два каталога приложения; укажите активный через --catalog-path.')
+    return candidates[0] if candidates else None
+
+
+def live_registration(project, thread_id, codex_home=None, catalog_path=None):
+    """Подтверждаем уже выполненную приложением регистрацию, ничего не перезаписывая."""
+    directory = codex_directory(codex_home)
+    path = directory / '.codex-global-state.json'
+    if not path.is_file():
+        return None
+    state = json.loads(path.read_text())
+    assignment = state.get('thread-project-assignments', {}).get(thread_id, {})
+    local = state.get('local-projects', {}).get(assignment.get('projectId'), {})
+    if assignment.get('projectKind') != 'local' or local.get('rootPaths') != [project['roots'][0]['path']]:
+        return None
+    catalog = catalog_database(codex_home, catalog_path)
+    if catalog is None:
+        return None
+    with closing(sqlite3.connect('file:' + str(catalog) + '?mode=ro', uri=True)) as connection:
+        visible = connection.execute('SELECT 1 FROM local_thread_catalog WHERE host_id=? AND thread_id=? AND missing_candidate=0',
+                                     ('local', thread_id)).fetchone()
+    with closing(sqlite3.connect('file:' + str(state_database(codex_home)) + '?mode=ro', uri=True)) as connection:
+        indexed = connection.execute('SELECT has_user_event,archived,project_id FROM threads WHERE id=?', (thread_id,)).fetchone()
+    if visible is None or indexed is None or indexed[0] != 1 or indexed[1] != 0 or indexed[2] != project['id']:
+        return None
+    return {'projectId': assignment['projectId'], 'nativeProjectId': project['id'], 'live': True, 'catalog': str(catalog)}
+
+
+def reset_catalog_sync(data_dir, codex_home=None, catalog_path=None):
     """Просим приложение пересканировать историю при следующем запуске."""
     directory = codex_directory(codex_home)
     if desktop_running(directory):
         return {'pending': True, 'reason': 'Каталог пересинхронизируется при закрытом приложении.'}
-    candidates = [directory / 'sqlite' / name for name in ('codex.db', 'codex-dev.db')]
-    candidates = [path for path in candidates if path.is_file()]
-    if not candidates:
+    selected = catalog_database(codex_home, catalog_path)
+    if selected is None:
         return {'available': False}
-    if len(candidates) != 1:
-        raise ValueError('Найдены два каталога приложения; автоматический выбор запрещён.')
-    connection = sqlite3.connect(candidates[0], timeout=10)
+    connection = sqlite3.connect(selected, timeout=10)
     connection.row_factory = sqlite3.Row
     try:
         record = connection.execute('SELECT * FROM local_thread_catalog_sync_state WHERE host_id=?', ('local',)).fetchone()
@@ -473,12 +513,17 @@ def desktop_running(directory):
     return any(re.search(r'/(ChatGPT|Codex)\.app/Contents/MacOS/(ChatGPT|Codex)$', line.strip()) for line in processes.splitlines())
 
 
-def register_project(project, thread_id, data_dir, codex_home=None):
+def register_project(project, thread_id, data_dir, codex_home=None, catalog_path=None):
     directory = codex_directory(codex_home)
     if desktop_running(directory):
+        live = live_registration(project, thread_id, codex_home, catalog_path)
+        if live is not None:
+            return live
         request = Path(data_dir) / ('register-' + thread_id + '.json')
         request.parent.mkdir(parents=True, exist_ok=True)
-        request.write_text(json.dumps({'project': project, 'threadId': thread_id, 'codexHome': str(directory)}, ensure_ascii=False, indent=2))
+        pending = json.loads(request.read_text()) if request.exists() else {}
+        pending.update(project=project, threadId=thread_id, codexHome=str(directory))
+        request.write_text(json.dumps(pending, ensure_ascii=False, indent=2))
         return {'pending': True, 'request': str(request.resolve()), 'reason': 'Приложение открыто и перезаписывает реестр из памяти. Регистрация выполняется после его закрытия.'}
     connection = sqlite3.connect(state_database(codex_home), timeout=10)
     connection.row_factory = sqlite3.Row
@@ -545,7 +590,7 @@ class Client:
         self.pending = b''
         self.sequence = 0
         try:
-            self.rpc('initialize', {'clientInfo': {'name': 'cloud_to_local_chat', 'version': '0.1'}, 'capabilities': {'experimentalApi': True}})
+            self.rpc('initialize', {'clientInfo': {'name': 'cloud_to_local_chat', 'version': '0.2.2'}, 'capabilities': {'experimentalApi': True}})
             self.send({'method': 'initialized', 'params': {}})
         except BaseException:
             self.close()
@@ -682,7 +727,7 @@ def migrate(source, project_root, project_name, data_dir, executable='codex', co
         client.close()
     receipt['dates'] = restore_dates(thread['id'], source, data_dir, codex_home, expected_items=items)
     receipt['registration'] = register_project(project, thread['id'], data_dir, codex_home)
-    if not receipt['registration'].get('pending'):
+    if not receipt['registration'].get('pending') and not receipt['registration'].get('live'):
         receipt['catalog'] = reset_catalog_sync(data_dir, codex_home)
     receipt['status'] = 'prepared'
     receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
@@ -776,10 +821,44 @@ def transfer_project(project_id, project_root, auth_data, executable='codex', co
     return report['summary']
 
 
+def finish_registrations(request_paths, data_dir, catalog_path=None, wait=False, timeout=900):
+    deadline = time.monotonic() + timeout
+    requests = [json.loads(Path(path).read_text()) for path in request_paths]
+    homes = {str(Path(r['codexHome']).resolve()) for r in requests}
+    if len(homes) != 1:
+        raise ValueError('Заявки должны относиться к одному хранилищу Codex.')
+    home = next(iter(homes))
+    catalog_database(home, catalog_path)  # Проверяем выбор до любых изменений.
+    dates_restored = set()
+    while True:
+        results = []
+        for path, request in zip(request_paths, requests):
+            if request.get('sourcePath') and request['threadId'] not in dates_restored:
+                source = json.loads(Path(request['sourcePath']).read_text())
+                request['dates'] = restore_dates(request['threadId'], source, data_dir, home)
+                dates_restored.add(request['threadId'])
+            results.append(register_project(request['project'], request['threadId'], data_dir, home, catalog_path))
+        pending = any(r.get('pending') for r in results)
+        catalog = None
+        if not pending:
+            catalog = {'available': True, 'live': True} if all(r.get('live') for r in results) else reset_catalog_sync(data_dir, home, catalog_path)
+            pending = bool(catalog.get('pending'))
+        if not pending:
+            for path, request, result in zip(request_paths, requests, results):
+                request.update(registration=result, status='registered', catalog=catalog)
+                Path(path).write_text(json.dumps(request, ensure_ascii=False, indent=2))
+            return {'registrations': results, 'status': 'registered', 'catalog': catalog}
+        if not wait:
+            return {'registrations': results, 'status': 'pending', 'catalog': catalog}
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Регистрация не завершена за отведённое время; заявка сохранена.')
+        time.sleep(0.5)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source', nargs='?', type=Path, help='Полный JSON ответа read_thread')
-    parser.add_argument('--chat-url', help='Получить чат из ChatGPT после входа в отдельном браузере')
+    parser.add_argument('--chat-url', help='Получить собственный /c/ или публичный /share/ чат ChatGPT')
     parser.add_argument('--project-id', help='Перенести чаты облачного проекта g-p-… по очереди')
     parser.add_argument('--project-root', type=Path)
     parser.add_argument('--project-name')
@@ -789,47 +868,28 @@ def main():
     parser.add_argument('--apply', action='store_true', help='Создать локальный чат; без флага только проверка источника')
     parser.add_argument('--register-request', type=Path, nargs='+', help='Завершить привязку проектов после закрытия приложения')
     parser.add_argument('--wait-for-app-exit', action='store_true', help='Дождаться закрытия приложения для записи реестра (до 15 минут)')
+    parser.add_argument('--catalog-path', type=Path, help='Активный sqlite/codex.db или codex-dev.db при наличии обоих')
     parser.add_argument('--refresh-catalog', action='store_true', help='Запросить полную пересинхронизацию локального каталога при закрытом приложении')
     args = parser.parse_args()
     if args.refresh_catalog:
         if not args.apply or args.register_request or args.source or args.chat_url or args.project_id:
             parser.error('Для пересинхронизации используйте --refresh-catalog --apply без источников.')
-        if args.wait_for_app_exit:
-            print('Ожидание полного выхода из ChatGPT/Codex для пересинхронизации каталога.', flush=True)
-            deadline = time.monotonic() + 900
-            while desktop_running(codex_directory(args.codex_home)):
-                if time.monotonic() > deadline:
-                    raise TimeoutError('Приложение не закрыто за 15 минут; каталог не изменён.')
-                time.sleep(0.5)
-            time.sleep(2)
-        print(json.dumps(reset_catalog_sync(args.data_dir, args.codex_home), ensure_ascii=False, indent=2), flush=True)
+        catalog_database(args.codex_home, args.catalog_path)
+        deadline = time.monotonic() + 900
+        while True:
+            result = reset_catalog_sync(args.data_dir, args.codex_home, args.catalog_path)
+            if not result.get('pending') or not args.wait_for_app_exit:
+                print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Каталог не обновлён за 15 минут; повторите завершение регистрации.')
+            time.sleep(0.5)
         return
     if args.register_request:
         if not args.apply:
             parser.error('Для записи реестра добавьте --apply.')
-        requests = [json.loads(path.read_text()) for path in args.register_request]
-        if args.wait_for_app_exit:
-            print('Ожидание закрытия ChatGPT. Реестр не изменён.', flush=True)
-            deadline = time.monotonic() + 900
-            while any(desktop_running(Path(request['codexHome']).resolve()) for request in requests):
-                if time.monotonic() > deadline:
-                    raise TimeoutError('Приложение не закрыто за 15 минут; реестр не изменён.')
-                time.sleep(0.5)
-            time.sleep(2)
-        results = []
-        for request_path, request in zip(args.register_request, requests):
-            if request.get('sourcePath'):
-                source = json.loads(Path(request['sourcePath']).read_text())
-                request['dates'] = restore_dates(request['threadId'], source, args.data_dir, request['codexHome'])
-            result = register_project(request['project'], request['threadId'], args.data_dir, request['codexHome'])
-            results.append(result)
-            if not result.get('pending'):
-                request['registration'] = result
-                request['status'] = 'registered'
-                request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2))
-        pending = any(result.get('pending') for result in results)
-        catalog = None if pending else reset_catalog_sync(args.data_dir, requests[0]['codexHome'])
-        print(json.dumps({'registrations': results, 'status': 'pending' if pending else 'registered', 'catalog': catalog}, ensure_ascii=False, indent=2), flush=True)
+        print(json.dumps(finish_registrations(args.register_request, args.data_dir, args.catalog_path,
+                                             args.wait_for_app_exit), ensure_ascii=False, indent=2), flush=True)
         return
     if args.project_id:
         if args.source or args.chat_url or not args.project_root or not args.apply:

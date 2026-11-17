@@ -10,14 +10,15 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import urlparse, urljoin
+from types import SimpleNamespace
+from urllib.parse import urlparse, urljoin, parse_qs
 
 
 def chat_id(url):
     parsed = urlparse(url)
-    match = re.fullmatch(r'/c/([a-zA-Z0-9-]+)', parsed.path.rstrip('/'))
+    match = re.fullmatch(r'/(?:c|share)/([a-zA-Z0-9-]+)', parsed.path.rstrip('/'))
     if parsed.scheme != 'https' or parsed.hostname != 'chatgpt.com' or parsed.username or parsed.password or parsed.port not in (None, 443) or not match:
-        raise ValueError('Нужна ссылка https://chatgpt.com/c/… на собственный чат.')
+        raise ValueError('Нужна ссылка https://chatgpt.com/c/… или https://chatgpt.com/share/….')
     return match.group(1)
 
 
@@ -242,7 +243,7 @@ def fetch_asset(context, token, url):
             raise ValueError('Неизвестный адрес сервера вложений; файл не скачан.')
         parsed = urlparse(url)
         options = {'max_redirects': 0, 'timeout': 120000}
-        if parsed.hostname == 'chatgpt.com' and parsed.path.startswith(('/api/library/', '/backend-api/')):
+        if token and parsed.hostname == 'chatgpt.com' and parsed.path.startswith(('/api/library/', '/backend-api/')):
             options['headers'] = {'Authorization': 'Bearer ' + token}
         response = http_get(context, url, **options)
         if response.status not in (301, 302, 303, 307, 308):
@@ -367,6 +368,19 @@ def list_project_chats(context, token, project_id):
         cursors.add(cursor)
 
 
+def shared_payload(context, identifier):
+    response = http_get(context, 'https://chatgpt.com/backend-api/share/' + identifier,
+                        timeout=30000, max_redirects=0)
+    if response.status != 200:
+        raise RuntimeError('Публичная история недоступна (HTTP ' + str(response.status) + '). Перенос остановлен.')
+    try:
+        payload = response.json()
+    except Exception:
+        raise ValueError('Сервер не вернул JSON публичной истории.') from None
+    active_messages(payload, identifier)
+    return payload
+
+
 def export_chat(url, data_dir, progress=print):
     identifier = chat_id(url)
     try:
@@ -377,6 +391,26 @@ def export_chat(url, data_dir, progress=print):
     source_path = output / 'source.json'
     if source_path.exists():
         raise ValueError('Источник уже сохранён: ' + str(source_path))
+    shared = urlparse(url).path.startswith('/share/')
+    if shared:
+        with sync_playwright() as runtime:
+            context = runtime.request.new_context()
+            try:
+                payload = shared_payload(SimpleNamespace(request=context), identifier)
+                messages = active_messages(payload, identifier)
+                needs_assets = any(
+                    m.get('metadata', {}).get('attachments') or
+                    any(isinstance(p, dict) and p.get('content_type') == 'image_asset_pointer'
+                        for p in m.get('content', {}).get('parts', [])) or
+                    any(isinstance(p, str) and 'sandbox:/' in p
+                        for p in m.get('content', {}).get('parts', []))
+                    for m in messages if m.get('author', {}).get('role') != 'system'
+                    and not m.get('metadata', {}).get('is_visually_hidden_from_conversation'))
+                if not needs_assets:
+                    return export_payload(SimpleNamespace(request=context), None, payload, identifier, output, progress, shared=True)
+            finally:
+                context.dispose()
+        progress('Публичная история получена; для оригиналов вложений используется сохранённый вход.', flush=True)
     profile = Path(data_dir).resolve() / 'browser-profile'
     ready = profile / '.chatgpt-login-ready'
     executable = chrome_executable()
@@ -396,12 +430,12 @@ def export_chat(url, data_dir, progress=print):
             token = session.json().get('accessToken')
             if not token:
                 raise RuntimeError('Сессия истекла или не прочитана. Требуется вход в отдельном профиле.')
-            response = http_get(context, 'https://chatgpt.com/backend-api/conversation/' + identifier,
+            response = http_get(context, 'https://chatgpt.com/backend-api/' + ('share/' if shared else 'conversation/') + identifier,
                         headers={'Authorization': 'Bearer ' + token}, timeout=30000, max_redirects=0)
             if response.status != 200:
                 raise RuntimeError('История недоступна (HTTP ' + str(response.status) + '). Перенос остановлен.')
             payload = response.json()
-            source = export_payload(context, token, payload, identifier, output, progress)
+            source = export_payload(context, token, payload, identifier, output, progress, shared=shared)
             ready.write_text('Сессия проверена получением истории.\n', encoding='utf-8')
             progress('[3/4] История подготовлена: ' + str(len(source['turns'])) + ' обменов, ' + str(sum(len(i.get('images', [])) + sum(c.get('type') == 'localImage' for c in i.get('content', [])) for t in source['turns'] for i in t['items'])) + ' изображений.', flush=True)
             return source
@@ -409,11 +443,13 @@ def export_chat(url, data_dir, progress=print):
             context.close()
 
 
-def export_payload(context, token, payload, identifier, output, progress=print):
+def export_payload(context, token, payload, identifier, output, progress=print, *, shared=False):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     (output / "raw.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     cache = {}
+    headers = {'Authorization': 'Bearer ' + token} if token else {}
+    shared_params = {'shared_conversation_id': identifier} if shared else {}
 
     def download_file(attachment):
         suffix = document_suffix(attachment)
@@ -431,22 +467,22 @@ def export_payload(context, token, payload, identifier, output, progress=print):
             cache[key] = result
             progress('  Файл недоступен (HTTP ' + str(status) + '); сохранена карточка вложения.', flush=True)
             return result
+        file_headers = dict(headers)
         if attachment.get('sandbox_path'):
-            headers = {'Authorization': 'Bearer ' + token}
             project = payload.get('gizmo_id')
             if project and project.startswith('g-p-'):
-                headers['chatgpt-project-id'] = project
+                file_headers['chatgpt-project-id'] = project
             resolver = http_get(context, 'https://chatgpt.com/backend-api/conversation/'
                                 + payload.get('conversation_id', payload.get('id')) + '/interpreter/download',
-                                headers=headers, max_redirects=0,
-                                params={'message_id': attachment['message_id'], 'sandbox_path': attachment['sandbox_path']})
+                                headers=file_headers, max_redirects=0,
+                                params={**shared_params, 'message_id': attachment['message_id'], 'sandbox_path': attachment['sandbox_path']})
         else:
             resolver = http_get(context, 'https://chatgpt.com/backend-api/files/' + identifier + '/download',
-                                headers={'Authorization': 'Bearer ' + token}, max_redirects=0)
+                                headers=headers, params=shared_params, max_redirects=0)
         if resolver.status == 404 and not attachment.get('sandbox_path'):
             resolver = http_get(context, 'https://chatgpt.com/backend-api/files/download/' + identifier,
-                                headers={'Authorization': 'Bearer ' + token}, max_redirects=0,
-                                params={'conversation_id': payload.get('conversation_id', payload.get('id')),
+                                headers=headers, max_redirects=0,
+                                params={**shared_params, 'conversation_id': payload.get('conversation_id', payload.get('id')),
                                         'download_intent': 'true', 'inline': 'false'})
         if resolver.status in (404, 410):
             return unavailable(resolver.status)
@@ -472,15 +508,22 @@ def export_payload(context, token, payload, identifier, output, progress=print):
     def download(pointer):
         if pointer in cache:
             return cache[pointer]
-        match = re.fullmatch(r'(?:file-service://|sediment://)(file[-_][a-zA-Z0-9_-]+)', pointer)
+        parsed_pointer = urlparse(pointer)
+        if parsed_pointer.query:
+            if not shared or parse_qs(parsed_pointer.query) != {'shared_conversation_id': [identifier]}:
+                raise ValueError('Изображение относится к другой публичной переписке.')
+            pointer_path = pointer.split('?', 1)[0]
+        else:
+            pointer_path = pointer
+        match = re.fullmatch(r'(?:file-service://|sediment://)(file[-_][a-zA-Z0-9_-]+)', pointer_path)
         if not match:
             raise ValueError('Неподдерживаемая ссылка на оригинал изображения.')
         resolver = http_get(context, 'https://chatgpt.com/backend-api/files/' + match.group(1) + '/download',
-                                       headers={'Authorization': 'Bearer ' + token}, max_redirects=0)
+                                       headers=headers, params=shared_params, max_redirects=0)
         if resolver.status in (403, 404):
             resolver = http_get(context, 'https://chatgpt.com/backend-api/files/download/' + match.group(1),
-                                headers={'Authorization': 'Bearer ' + token}, max_redirects=0,
-                                params={'conversation_id': identifier, 'gizmo_id': payload.get('gizmo_id'),
+                                headers=headers, max_redirects=0,
+                                params={**shared_params, 'conversation_id': identifier, 'gizmo_id': payload.get('gizmo_id'),
                                         'download_intent': 'false', 'inline': 'true'})
         if resolver.status != 200:
             raise RuntimeError('Оригинал изображения недоступен (HTTP ' + str(resolver.status) + '). Перенос остановлен.')
@@ -500,5 +543,8 @@ def export_payload(context, token, payload, identifier, output, progress=print):
         return str(path)
 
     source = convert(payload, identifier, download, download_file)
+    if shared:
+        source['provenance'].update(method='public-share-response', sharedConversationId=identifier,
+                                    backingConversationId=payload.get('backing_conversation_id'))
     (output / "source.json").write_text(json.dumps(source, ensure_ascii=False, indent=2), encoding="utf-8")
     return source
